@@ -12,17 +12,79 @@ export default async function handler(req, res) {
   const isInstagram = url.includes("instagram.com");
 
   try {
-    if (isInstagram) {
-      return await handleInstagram(url, res);
-    } else {
-      return await handleGenericUrl(url, res);
+    const result = isInstagram
+      ? await handleInstagram(url)
+      : await handleGenericUrl(url);
+
+    // If we have a name + city but weak/missing coordinates, geocode it
+    const needsGeocoding =
+      result &&
+      !result.error &&
+      result.name &&
+      (result.city || result.state) &&
+      (!result.latitude || !result.longitude || result.confidence === "low");
+
+    if (needsGeocoding) {
+      const geocoded = await geocode(result.name, result.city, result.state, result.country);
+      if (geocoded) {
+        result.latitude = geocoded.latitude;
+        result.longitude = geocoded.longitude;
+        result.address = geocoded.address || result.address;
+        result.geocoded = true;
+        // Upgrade confidence if we were low and now have real coords
+        if (result.confidence === "low") result.confidence = "medium";
+        result.confidence_reason = (result.confidence_reason || "") + " (address resolved via geocoding)";
+      }
     }
+
+    return res.status(200).json(result);
   } catch (e) {
     return res.status(500).json({ error: "Extraction failed", detail: e.message });
   }
 }
 
-async function handleInstagram(url, res) {
+// ─── GEOCODING via Nominatim (OpenStreetMap) ──────────────────────────────────
+
+async function geocode(name, city, state, country) {
+  try {
+    const query = [name, city, state, country].filter(Boolean).join(", ");
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1&addressdetails=1`;
+
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "PinIt-App/1.0 (location pin saver)",
+        "Accept-Language": "en",
+      },
+    });
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || data.length === 0) return null;
+
+    const hit = data[0];
+    const addr = hit.address || {};
+
+    // Build a clean address string from components
+    const parts = [
+      addr.house_number && addr.road ? `${addr.house_number} ${addr.road}` : addr.road,
+      addr.city || addr.town || addr.village || addr.suburb,
+      addr.state,
+      addr.postcode,
+    ].filter(Boolean);
+
+    return {
+      latitude: parseFloat(hit.lat),
+      longitude: parseFloat(hit.lon),
+      address: parts.join(", ") || hit.display_name,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ─── INSTAGRAM PIPELINE ───────────────────────────────────────────────────────
+
+async function handleInstagram(url) {
   const signals = {};
 
   const [htmlResult, oembedResult] = await Promise.allSettled([
@@ -54,19 +116,21 @@ Reason across ALL signals together to identify the specific business. Consider:
 Return ONLY a raw JSON object, no markdown, no explanation:
 {
   "name": "Exact business name",
-  "address": "Full street address",
-  "city": "City",
-  "state": "State abbreviation",
-  "country": "Country",
+  "address": "Full street address or empty string if unknown",
+  "city": "City or empty string if unknown",
+  "state": "State abbreviation or empty string if unknown",
+  "country": "Country or empty string if unknown",
   "category": "restaurant|bar|coffee|retail|other",
-  "latitude": 40.7128,
-  "longitude": -74.0060,
+  "latitude": null,
+  "longitude": null,
   "confidence": "high|medium|low",
   "confidence_reason": "Brief explanation of what signals led to this conclusion",
   "source_signal": "location_tag|caption_mention|account_name|visual|combined"
 }
 
-If you truly cannot identify a specific business, return:
+IMPORTANT: If you know the business name and city but not the exact address, still return the name and city — a geocoder will resolve the coordinates. Only set confidence to high if you are certain of the specific location. Set latitude and longitude to null if you are not certain — the geocoder will fill them in.
+
+If you truly cannot identify any specific business at all, return:
 {"error": "Could not identify a specific business", "what_we_found": "describe what signals were present"}`;
 
   const userContent = [];
@@ -94,9 +158,10 @@ Additional metadata: ${signals.additionalMeta || "none"}
 Please identify the specific business from these signals.`,
   });
 
-  const claudeRes = await callClaude(systemPrompt, userContent);
-  return res.status(200).json(claudeRes);
+  return await callClaude(systemPrompt, userContent);
 }
+
+// ─── FETCH INSTAGRAM HTML ─────────────────────────────────────────────────────
 
 async function fetchInstagramHTML(url) {
   const signals = {};
@@ -151,7 +216,7 @@ async function fetchInstagramHTML(url) {
       } catch (_) {}
     }
 
-    // Hashtags and mentions from caption
+    // Hashtags and mentions
     if (signals.caption) {
       const hashtags = signals.caption.match(/#[\w]+/g);
       const mentions = signals.caption.match(/@[\w.]+/g);
@@ -171,6 +236,8 @@ async function fetchInstagramHTML(url) {
   return signals;
 }
 
+// ─── OEMBED ───────────────────────────────────────────────────────────────────
+
 async function fetchOEmbed(url) {
   const signals = {};
   try {
@@ -186,18 +253,20 @@ async function fetchOEmbed(url) {
   return signals;
 }
 
-async function handleGenericUrl(url, res) {
+// ─── GENERIC URL HANDLER ──────────────────────────────────────────────────────
+
+async function handleGenericUrl(url) {
   const systemPrompt = `You are a location extraction assistant. Given a URL (Yelp, Infatuation, TikTok, Google Maps, a restaurant website, etc.), identify the business and return ONLY a raw JSON object:
 
 {
   "name": "Business name",
-  "address": "Full street address",
+  "address": "Full street address or empty string if unknown",
   "city": "City",
   "state": "State abbreviation",
   "country": "Country",
   "category": "restaurant|bar|coffee|retail|other",
-  "latitude": 40.7128,
-  "longitude": -74.0060,
+  "latitude": null,
+  "longitude": null,
   "confidence": "high|medium|low",
   "confidence_reason": "What signals led to this",
   "source_signal": "url_structure|known_business|other"
@@ -205,9 +274,10 @@ async function handleGenericUrl(url, res) {
 
 If you cannot identify a specific business: {"error": "Could not identify business from this link"}`;
 
-  const result = await callClaude(systemPrompt, [{ type: "text", text: `Extract the business from: ${url}` }]);
-  return res.status(200).json(result);
+  return await callClaude(systemPrompt, [{ type: "text", text: `Extract the business from: ${url}` }]);
 }
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 async function callClaude(system, userContent) {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
